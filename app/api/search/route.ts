@@ -17,7 +17,8 @@ const cohere = new CohereClientV2({
 });
 
 export async function POST(req: Request) {
-  const { query } = await req.json();
+  const { query, topN = 5 } = await req.json();
+  const safeTopN = Math.min(Math.max(Number(topN), 1), 20);
 
   if (!query || typeof query !== "string") {
     return NextResponse.json({ error: "Missing query" }, { status: 400 });
@@ -32,7 +33,7 @@ export async function POST(req: Request) {
 
   const { data: candidates, error } = await supabase.rpc("match_documents", {
     query_embedding: queryEmbedding,
-    match_count: 30,
+    match_count: Math.max(30, safeTopN * 5),
   });
 
   if (error) {
@@ -51,7 +52,7 @@ Text: ${r.text ?? ""}`
     model: "rerank-v3.5",
     query,
     documents,
-    topN: 5,
+    topN: safeTopN,
   });
 
   const results = reranked.results.map((item: any) => {
@@ -63,5 +64,115 @@ Text: ${r.text ?? ""}`
     };
   });
 
-  return NextResponse.json({ results });
+  const answerPassages = results.slice(0, Math.min(8, safeTopN));
+
+  const explanationPrompt = results
+    .map(
+      (r: any, i: number) => `
+[${i}]
+Title: ${r.title ?? ""}
+Author: ${r.author ?? ""}
+Date: ${r.date ?? ""}
+Source: ${r.source ?? ""}
+Text: ${r.text ?? ""}
+`
+    )
+    .join("\n\n");
+
+  const explanationResponse = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [
+      {
+        role: "system",
+        content: `
+You explain why retrieved corpus passages are relevant to a user's question.
+
+For each passage, write one concise sentence.
+Use only the passage itself.
+Do not overstate relevance.
+If relevance is weak, say so.
+Return valid JSON only.
+      `,
+      },
+      {
+        role: "user",
+        content: `
+Question:
+${query}
+
+Passages:
+${explanationPrompt}
+
+Return JSON in this format:
+[
+  {"index": 0, "explanation": "..."},
+  {"index": 1, "explanation": "..."}
+]
+      `,
+      },
+    ],
+  });
+
+  let explanations: any[] = [];
+
+  try {
+    explanations = JSON.parse(explanationResponse.choices[0].message.content ?? "[]");
+  } catch {
+    explanations = [];
+  }
+
+  const resultsWithExplanations = results.map((result: any, index: number) => {
+    const match = explanations.find((e: any) => e.index === index);
+
+    return {
+      ...result,
+      explanation: match?.explanation ?? "",
+    };
+  });
+
+  const context = answerPassages
+    .map(
+      (r: any, i: number) => `
+[${i + 1}]
+Title: ${r.title ?? ""}
+Author: ${r.author ?? ""}
+Date: ${r.date ?? ""}
+Source: ${r.source ?? ""}
+Text: ${r.text ?? ""}
+`
+    )
+    .join("\n\n");
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [
+      {
+        role: "system",
+        content: `
+You are a scholarly research assistant for a digital humanities corpus.
+
+Answer the user's question using only the provided passages.
+Do not invent sources.
+If the passages are insufficient, say so clearly.
+Cite passages using bracket numbers like [1], [2], [3].
+Keep the answer concise and evidence-based.
+      `,
+      },
+      {
+        role: "user",
+        content: `
+Question:
+${query}
+
+Passages:
+${context}
+      `,
+      },
+    ],
+  });
+
+  return NextResponse.json({
+    answer: completion.choices[0].message.content,
+    results: resultsWithExplanations,
+  });
 }
